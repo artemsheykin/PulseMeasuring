@@ -1,58 +1,54 @@
 #include <Arduino.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
-const int pulsePin = 21; // pin for sending the pulse
-const int measurePin = 22; // pin for measuring the pulse
+const int pulsePin = 21; // pin number where the pulse will be generated
+const int measurementPin = 22; // pin number to measure the pulse duration
 
-unsigned long startTime;
-unsigned long endTime;
-bool measurementstarted = false;
+volatile bool pulseState = HIGH;
+volatile bool pulseMeasurementStarted = false;
+volatile uint64_t pulseStartTime = 0;
+volatile float pulseDuration = 0;
 
-// Task to send the pulse on a specific pin 
-void sendPulseTask(void *parameter) {
-  for (;;) {  
-    pinMode(pulsePin, OUTPUT);  // set up pin for output
-    digitalWrite(pulsePin, HIGH); // start pulse
-    delayMicroseconds(1000); // adjust pulse length as needed
-    digitalWrite(pulsePin, LOW);  // end pulse
-    vTaskDelay(1); // add a delay to avoid excessive CPU usage (crashes without)
-  }
+hw_timer_t *pulseTimer = NULL;
+hw_timer_t *measureTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR pulseInterrupt() {
+  portENTER_CRITICAL_ISR(&timerMux);
+  pulseState = !pulseState; // invert pin state, basically square wave with 50% duty cycle
+  digitalWrite(pulsePin, pulseState);
+  portEXIT_CRITICAL_ISR(&timerMux);
 }
 
-
 void setup() {
-
   Serial.begin(115200);
 
-  pinMode(measurePin, INPUT_PULLDOWN); // set up pin for input, default state is low
+  pinMode(pulsePin, OUTPUT);
+  pinMode(measurementPin, INPUT_PULLUP);
 
-  // create and run pulse sending task on different core
-  xTaskCreatePinnedToCore(sendPulseTask, "SendPulseTask", 1000, NULL, 1, NULL, 0); // task runs on core 0
+  // Configure the pulseTimer
+  pulseTimer = timerBegin(0, 80, true); // timer 0, timer speed = 1 MHz, counting up
+  timerAttachInterrupt(pulseTimer, &pulseInterrupt, true); // true for edge-triggered
+  timerAlarmWrite(pulseTimer, 10000, true); // repeating
+  timerAlarmEnable(pulseTimer);
 
+  // Confugure the measureTimer
+  measureTimer = timerBegin(1, 2, true);  // timer 1, timer speed = 40 MHz (can't go lower), counting up
 }
 
 void loop() {
-  // loop() runs on core 1, using loop to run pulse measuring task
-
-  while (digitalRead(measurePin) == LOW && measurementstarted == false) {} // waiting for pulse
-
-  
-  // pulse detected
-  if (digitalRead(measurePin) == HIGH && measurementstarted == false) {
-    startTime = micros(); // timestamp
-    measurementstarted = true;
-  }
-
-  while (digitalRead(measurePin) == HIGH && measurementstarted == true){} // wait for pulse to end
-
-  
-  // pulse ended (pin went low again)
-  if (digitalRead(measurePin) == LOW && measurementstarted == true) {
-    endTime = micros(); // timestamp
-    measurementstarted = false; // reset bool
-    
-    unsigned long pulseLength = endTime - startTime;
-    Serial.println(pulseLength);
+  // Measure the pulse duration
+  if (digitalRead(measurementPin) == HIGH && !pulseMeasurementStarted) {
+    pulseStartTime = timerRead(measureTimer);
+    pulseMeasurementStarted = true;
+  } else if (digitalRead(measurementPin) == LOW && pulseMeasurementStarted) {
+    pulseDuration = static_cast<float>(timerRead(measureTimer) - pulseStartTime) / 80.0f; //resolution is 25 ns
+    pulseMeasurementStarted = false;
+    Serial.print("Pulse duration: ");
+    Serial.print(pulseDuration);
+    Serial.println(" microseconds");
   }
 }
+
+
+
+
